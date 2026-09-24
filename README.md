@@ -2,15 +2,17 @@
 
 一个零依赖的 Mock MCP 服务器，采用**双面架构**：
 
-- **控制面（MCP stdio）**：AI Agent 通过 8 个工具动态配置 mock 规则、查看请求日志
-- **数据面（HTTP）**：页面请求经路由匹配后，按规则返回符合 `BaseRes` / `PageRes` 结构的响应
+- **控制面（MCP stdio）**：AI Agent 通过 10 个工具动态配置 mock 规则、查看请求日志
+- **数据面（HTTP）**：页面请求经路由匹配后，按规则返回符合 `BaseRes` / `PageRes` 结构的响应，同时支持 **SSE 事件流**和 **WebSocket** mock
 
 让本地页面"看似正常请求，实际返回 MCP 配置的 mock 数据"，AI 工作流无需改代码即可造数据。
 
 ## 特性
 
 - 🚀 零外部依赖，仅使用 Node.js 内置模块
-- 🔧 8 个 MCP 工具，支持动态增删规则、热切换端口
+- 🔧 10 个 MCP 工具，支持动态增删规则、热切换端口
+- 📡 SSE 事件流 mock：按配置间隔推送事件数据，支持 `{{index}}` 模板与自动关闭
+- 🔌 WebSocket mock：纯 Node.js 实现 RFC 6455 协议，支持连接初始消息与响应循环
 - 📄 分页接口自动生成：按 `pageNum` / `pageSize` 切片，支持条目模板轮换与 `{{index}}` 占位
 - 🎯 最长路径优先匹配，支持省略 method 匹配任意请求方法
 - 📥 启动时自动加载初始规则文件，规则可跨重启保留
@@ -63,6 +65,8 @@ mock-mcp-server --help
 | `start_mock_server` | 启动 / 切换 HTTP 端口（默认 9798） |
 | `set_mock_data` | 为接口配置固定返回数据（`model` 作为 `BaseRes.model`） |
 | `set_mock_list` | 为分页接口配置条目模板 + 总条数，按请求参数自动生成对应页 |
+| `set_mock_sse` | 为 SSE 接口配置事件流 mock（按间隔推送 events，支持自动关闭） |
+| `set_mock_ws` | 为 WebSocket 接口配置消息响应 mock（支持初始消息与响应循环） |
 | `remove_mock_rule` | 删除单条规则 |
 | `clear_mock_rules` | 清空全部规则 |
 | `list_mock_rules` | 查看全部规则及命中次数 |
@@ -108,6 +112,48 @@ mock-mcp-server --help
 - **字符串占位**：`{{index}}` 替换为全局行号（从 1 开始），常用于生成 ID
 - **`extra` 字段**：业务自定义字段会合并到分页 `model` 中（如 `statusCounts`）
 
+### SSE 事件流
+
+当请求头包含 `Accept: text/event-stream` 且 URL 匹配到 `sse` 模式规则时，服务端按 `intervalMs` 间隔逐条推送事件：
+
+```json
+{
+  "mode": "sse",
+  "url": "/api/events/stream",
+  "events": [
+    { "type": "update", "data": { "id": "{{index}}", "status": "processing" } },
+    { "type": "update", "data": { "id": "{{index}}", "status": "done" } }
+  ],
+  "intervalMs": 2000,
+  "closeAfterEvents": 10
+}
+```
+
+- `events` 为空时持续发送心跳
+- `closeAfterEvents` 指定推送条数后关闭连接，缺省持续发送
+- 事件数据支持 `{{index}}` 模板替换
+
+### WebSocket
+
+页面通过 `ws://` 连接时，HTTP 服务器自动处理协议升级（纯 Node.js 实现，零外部依赖）：
+
+```json
+{
+  "mode": "ws",
+  "url": "/ws/chat",
+  "initialMessage": { "type": "welcome", "text": "连接成功" },
+  "responses": [
+    { "type": "reply", "text": "收到消息: {{index}}" },
+    { "type": "reply", "text": "已处理" }
+  ]
+}
+```
+
+- `initialMessage`：连接建立后服务端主动发送的首条消息（可选）
+- `responses`：收到客户端消息后按序循环响应，未配置时默认 echo 回原始消息
+- 响应数据支持 `{{index}}` 模板替换
+- WebSocket 请求同样记录到请求日志（method 为 `WS`）
+
 ## 配置
 
 ### 端口配置
@@ -138,6 +184,19 @@ MOCK_MCP_HTTP_PORT=8888 npx mock-mcp-server
     "mode": "data",
     "url": "/api/users/detail",
     "model": { "id": "1", "name": "张三" }
+  },
+  {
+    "mode": "sse",
+    "url": "/api/events/stream",
+    "events": [{ "type": "tick", "value": "{{index}}" }],
+    "intervalMs": 1000,
+    "closeAfterEvents": 5
+  },
+  {
+    "mode": "ws",
+    "url": "/ws/chat",
+    "initialMessage": { "type": "welcome" },
+    "responses": [{ "type": "echo", "text": "收到" }]
   }
 ]
 ```

@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-import type { IncomingMessage, Server, ServerResponse } from 'node:http'
 /**
  * 【industry-platform Mock MCP 服务器】
  *
@@ -7,19 +6,24 @@ import type { IncomingMessage, Server, ServerResponse } from 'node:http'
  * 双面架构的 mock 服务器,让本地页面"看似正常请求,实际返回 MCP 配置的 mock 数据":
  * - 控制面(MCP stdio):AI Agent 通过工具配置 mock 规则、查看请求日志
  * - 数据面(HTTP):页面请求经 isMock + VITE_MOCK_URL 路由到本服务,按规则返回 BaseRes 数据
+ *   - 普通 HTTP 请求 → BaseRes / PageRes 响应
+ *   - SSE (Accept: text/event-stream) → 按间隔推送事件流
+ *   - WebSocket (ws:// upgrade) → 按规则响应消息(纯 Node.js 实现,无外部依赖)
  *
  * 启动方式(由 MCP 客户端拉起):
  * npx mock-mcp-server
  *
  * 暴露工具:
- * - get_status       查看 HTTP 服务状态与规则数量
+ * - get_status        查看 HTTP 服务状态与规则数量
  * - start_mock_server 启动/切换 HTTP 端口(默认 9798,进程启动时自动尝试)
- * - set_mock_data    为接口配置固定返回数据(model)
- * - set_mock_list    为分页接口配置条目模板 + 总条数,按请求 pageNum/pageSize 自动生成对应页
- * - remove_mock_rule 删除单条规则
- * - clear_mock_rules 清空全部规则
- * - list_mock_rules  查看全部规则
- * - get_requests     查看页面最近的请求日志(用于发现未配置 mock 的接口)
+ * - set_mock_data     为接口配置固定返回数据(model)
+ * - set_mock_list     为分页接口配置条目模板 + 总条数,按请求 pageNum/pageSize 自动生成对应页
+ * - set_mock_sse      为 SSE 接口配置事件流 mock
+ * - set_mock_ws       为 WebSocket 接口配置消息响应 mock
+ * - remove_mock_rule  删除单条规则
+ * - clear_mock_rules  清空全部规则
+ * - list_mock_rules   查看全部规则
+ * - get_requests      查看页面最近的请求日志(用于发现未配置 mock 的接口)
  *
  * 数据规则:
  * - 响应统一包裹为 BaseRes:{ succeed: true, code: '0', message: '成功', model, total }
@@ -27,8 +31,10 @@ import type { IncomingMessage, Server, ServerResponse } from 'node:http'
  * - 条目模板支持:数组值按行号轮换、字符串内 {{index}} 替换为全局行号(1 开始)
  */
 import { Buffer } from 'node:buffer'
+import { createHash } from 'node:crypto'
 import { existsSync, readFileSync } from 'node:fs'
-import { createServer } from 'node:http'
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
+import type { Socket } from 'node:net'
 import path from 'node:path'
 import process from 'node:process'
 import { createInterface } from 'node:readline'
@@ -43,6 +49,8 @@ const DEFAULT_HTTP_PORT = 9798
 const SUCCESS_CODE = '0'
 /** 请求日志上限 */
 const MAX_LOG_SIZE = 100
+/** WebSocket GUID(RFC 6455) */
+const WS_GUID = '258EAFA5-E914-47DA-95CA-5AB9DC11B65B'
 
 /** mock 规则 */
 interface MockRule {
@@ -50,8 +58,8 @@ interface MockRule {
   url: string
   /** HTTP 方法(大写),缺省匹配任意方法 */
   method?: string
-  /** data = 固定数据;list = 分页列表模板 */
-  mode: 'data' | 'list'
+  /** data = 固定数据;list = 分页列表模板;sse = 事件流;ws = WebSocket */
+  mode: 'data' | 'list' | 'sse' | 'ws'
   /** data 模式:作为 BaseRes.model 返回 */
   model?: unknown
   /** data 模式:直接作为整个响应体返回(不包裹 BaseRes) */
@@ -64,6 +72,16 @@ interface MockRule {
   extra?: Record<string, unknown>
   /** 延迟响应毫秒数(模拟 loading) */
   delayMs?: number
+  /** sse 模式:要推送的事件数据列表 */
+  events?: unknown[]
+  /** sse 模式:事件间隔毫秒,默认 1000 */
+  intervalMs?: number
+  /** sse 模式:发送多少个事件后关闭,缺省持续发送 */
+  closeAfterEvents?: number
+  /** ws 模式:连接建立后发送的初始消息 */
+  initialMessage?: unknown
+  /** ws 模式:收到消息后的响应列表(按序循环) */
+  responses?: unknown[]
   createdAt: number
   hitCount: number
 }
@@ -95,6 +113,16 @@ interface MockRuleInput {
   /** 额外字段(业务自定义,会合并到分页 model 中) */
   extra?: Record<string, unknown>
   delayMs?: number
+  /** sse 模式:要推送的事件数据列表 */
+  events?: unknown[]
+  /** sse 模式:事件间隔毫秒,默认 1000 */
+  intervalMs?: number
+  /** sse 模式:发送多少个事件后关闭 */
+  closeAfterEvents?: number
+  /** ws 模式:连接建立后发送的初始消息 */
+  initialMessage?: unknown
+  /** ws 模式:收到消息后的响应列表(按序循环) */
+  responses?: unknown[]
 }
 
 // ——————————————————————————————————————————————————————————————
@@ -105,6 +133,8 @@ const mockRules = new Map<string, MockRule>()
 const requestLog: RequestLogEntry[] = []
 let httpServer: Server | null = null
 let httpPort: number | null = null
+/** 活跃 WebSocket 连接数 */
+let wsConnectionCount = 0
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -140,6 +170,37 @@ export function setMockList(input: MockRuleInput): MockRule {
     total: typeof input.total === 'number' ? input.total : 50,
     extra: input.extra,
     delayMs: input.delayMs,
+    createdAt: Date.now(),
+    hitCount: 0,
+  }
+  mockRules.set(ruleKey(rule.url, rule.method), rule)
+  return rule
+}
+
+/** 配置 SSE 事件流规则:events 为要推送的事件数据列表 */
+export function setMockSse(input: MockRuleInput): MockRule {
+  const rule: MockRule = {
+    url: input.url,
+    method: input.method?.toUpperCase(),
+    mode: 'sse',
+    events: Array.isArray(input.events) ? input.events : [],
+    intervalMs: typeof input.intervalMs === 'number' ? input.intervalMs : 1000,
+    closeAfterEvents: typeof input.closeAfterEvents === 'number' ? input.closeAfterEvents : undefined,
+    delayMs: input.delayMs,
+    createdAt: Date.now(),
+    hitCount: 0,
+  }
+  mockRules.set(ruleKey(rule.url, rule.method), rule)
+  return rule
+}
+
+/** 配置 WebSocket mock 规则:initialMessage 为连接后首条消息,responses 为收到消息后的响应列表(循环) */
+export function setMockWs(input: MockRuleInput): MockRule {
+  const rule: MockRule = {
+    url: input.url,
+    mode: 'ws',
+    initialMessage: input.initialMessage,
+    responses: Array.isArray(input.responses) ? input.responses : undefined,
     createdAt: Date.now(),
     hitCount: 0,
   }
@@ -185,6 +246,174 @@ function matchRule(method: string, path: string): MockRule | null {
     if (!matched || rule.url.length > matched.url.length) matched = rule
   }
   return matched
+}
+
+// ——————————————————————————————————————————————————————————————
+// SSE 数据面
+// ——————————————————————————————————————————————————————————————
+
+/** 处理 SSE mock 请求:按 intervalMs 间隔逐条推送 events 中的事件 */
+async function handleSseRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  rule: MockRule,
+): Promise<void> {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'Access-Control-Allow-Origin': '*',
+  })
+  res.flushHeaders?.()
+
+  const events = rule.events ?? []
+  const interval = rule.intervalMs ?? 1000
+  const closeAfter = rule.closeAfterEvents
+
+  let idx = 0
+  const sendNext = () => {
+    if (events.length === 0) {
+      res.write(`data: ${JSON.stringify({ message: 'mock sse connected' })}\n\n`)
+      idx++
+    } else {
+      const event = expandTemplate(events[idx % events.length], idx)
+      res.write(`data: ${JSON.stringify(event)}\n\n`)
+      idx++
+    }
+    if (closeAfter && idx >= closeAfter) {
+      res.end()
+      return
+    }
+    setTimeout(sendNext, interval)
+  }
+
+  req.on('close', () => { /* client disconnected */ })
+  sendNext()
+}
+
+// ——————————————————————————————————————————————————————————————
+// WebSocket 数据面(纯 Node.js 实现,无外部依赖)
+// ——————————————————————————————————————————————————————————————
+
+/** 计算 WebSocket Accept Key(RFC 6455) */
+function computeWsAcceptKey(key: string): string {
+  return createHash('sha1').update(key + WS_GUID).digest('base64')
+}
+
+/** 解析 WebSocket 帧(客户端→服务端,仅处理 text/close/ping) */
+function parseWsFrame(buf: Buffer): { opcode: number; payload: string } | null {
+  if (buf.length < 2) return null
+  const opcode = buf[0] & 0x0f
+  const masked = (buf[1] & 0x80) !== 0
+  let payloadLen = buf[1] & 0x7f
+  let offset = 2
+  if (payloadLen === 126) {
+    if (buf.length < 4) return null
+    payloadLen = buf.readUInt16BE(2)
+    offset = 4
+  } else if (payloadLen === 127) {
+    if (buf.length < 10) return null
+    payloadLen = Number(buf.readBigUInt64BE(2))
+    offset = 10
+  }
+  if (masked) {
+    if (buf.length < offset + 4 + payloadLen) return null
+    const maskKey = buf.subarray(offset, offset + 4)
+    const payload = buf.subarray(offset + 4, offset + 4 + payloadLen)
+    for (let i = 0; i < payload.length; i++) payload[i] ^= maskKey[i % 4]!
+    return { opcode, payload: payload.toString('utf8') }
+  }
+  if (buf.length < offset + payloadLen) return null
+  return { opcode, payload: buf.subarray(offset, offset + payloadLen).toString('utf8') }
+}
+
+/** 构造 WebSocket 帧(服务端→客户端,无需 mask) */
+function buildWsFrame(data: string): Buffer {
+  const payload = Buffer.from(data, 'utf8')
+  const len = payload.length
+  let headerLen: number
+  if (len < 126) {
+    headerLen = 2
+  } else if (len < 65536) {
+    headerLen = 4
+  } else {
+    headerLen = 10
+  }
+  const frame = Buffer.allocUnsafe(headerLen + len)
+  frame[0] = 0x81 // FIN + text opcode
+  if (len < 126) {
+    frame[1] = len
+  } else if (len < 65536) {
+    frame[1] = 126
+    frame.writeUInt16BE(len, 2)
+  } else {
+    frame[1] = 127
+    frame.writeBigUInt64BE(BigInt(len), 2)
+  }
+  payload.copy(frame, headerLen)
+  return frame
+}
+
+/** 处理 WebSocket 连接:握手 + 按 mock 规则响应消息 */
+function handleWsConnection(socket: Socket, req: IncomingMessage): void {
+  const key = req.headers['sec-websocket-key']
+  if (!key) { socket.destroy(); return }
+
+  const acceptKey = computeWsAcceptKey(key)
+  socket.write(
+    'HTTP/1.1 101 Switching Protocols\r\n'
+    + 'Upgrade: websocket\r\n'
+    + 'Connection: Upgrade\r\n'
+    + `Sec-WebSocket-Accept: ${acceptKey}\r\n`
+    + '\r\n',
+  )
+  wsConnectionCount++
+
+  const wsPath = (req.url ?? '/').replace(/\/+$/, '') || '/'
+  let buffer = Buffer.alloc(0)
+
+  socket.on('data', (chunk: Buffer) => {
+    buffer = Buffer.concat([buffer, chunk])
+    const frame = parseWsFrame(buffer)
+    if (!frame) return
+    buffer = Buffer.alloc(0)
+
+    // ping → pong
+    if (frame.opcode === 0x09) {
+      socket.write(Buffer.from([0x8a, 0x00]))
+      return
+    }
+    // text frame
+    if (frame.opcode === 0x01) {
+      const msg = frame.payload
+      requestLog.push({
+        time: new Date().toISOString(),
+        method: 'WS',
+        path: wsPath,
+        matched: null,
+      })
+      if (requestLog.length > MAX_LOG_SIZE) requestLog.shift()
+
+      const rule = matchRule('WS', wsPath)
+      if (rule) {
+        if (rule.hitCount === 0 && rule.initialMessage !== undefined) {
+          socket.write(buildWsFrame(JSON.stringify(rule.initialMessage)))
+        }
+        rule.hitCount++
+        if (rule.responses && rule.responses.length > 0) {
+          const respIdx = (rule.hitCount - 1) % rule.responses.length
+          const resp = expandTemplate(rule.responses[respIdx], rule.hitCount - 1)
+          socket.write(buildWsFrame(JSON.stringify(resp)))
+        }
+      } else {
+        // 兜底 echo
+        socket.write(buildWsFrame(JSON.stringify({ echo: msg, timestamp: Date.now() })))
+      }
+    }
+  })
+
+  socket.on('error', () => { /* client disconnected */ })
+  socket.on('close', () => { wsConnectionCount-- })
 }
 
 // ——————————————————————————————————————————————————————————————
@@ -356,6 +585,18 @@ async function handleHttpRequest(req: IncomingMessage, res: ServerResponse): Pro
     return
   }
 
+  // SSE:检测 Accept 头,路由到 SSE 处理器
+  const acceptHeader = String(req.headers.accept ?? '')
+  if (acceptHeader.includes('text/event-stream')) {
+    const sseRule = matchRule(method, path)
+    if (sseRule && sseRule.mode === 'sse') {
+      requestLog.push({ time: new Date().toISOString(), method, path, matched: ruleKey(sseRule.url, sseRule.method) })
+      sseRule.hitCount++
+      await handleSseRequest(req, res, sseRule)
+      return
+    }
+  }
+
   const queryParams = Object.fromEntries(parsedUrl.searchParams)
   const bodyParams = await readJsonBody(req)
   const paging = extractPaging(queryParams, bodyParams)
@@ -413,6 +654,10 @@ export async function startMockServer(
       httpPort = port
       resolve({ port, started: true, message: `mock HTTP 服务已启动:http://127.0.0.1:${port}` })
     })
+    // WebSocket 升级处理
+    server.on('upgrade', (req: IncomingMessage, socket: Socket) => {
+      handleWsConnection(socket, req)
+    })
   })
 }
 
@@ -422,6 +667,7 @@ export function getServerStatus(): Record<string, unknown> {
     port: httpPort,
     ruleCount: mockRules.size,
     requestLogSize: requestLog.length,
+    wsConnections: wsConnectionCount,
   }
 }
 
@@ -482,6 +728,48 @@ const TOOLS = [
         delayMs: { type: 'number', description: '延迟毫秒数,模拟 loading' },
       },
       required: ['url', 'item'],
+    },
+  },
+  {
+    name: 'set_mock_sse',
+    description:
+      '为 SSE(Server-Sent Events) 接口配置 mock。页面以 Accept: text/event-stream 请求 url 时,服务端按 intervalMs 间隔逐条推送 events 中的事件数据。events 为空时持续发送心跳。closeAfterEvents 指定推送多少条后关闭连接,缺省持续发送。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        url: { type: 'string', description: 'SSE 接口路径,如 /api/events/stream' },
+        method: { type: 'string', description: 'HTTP 方法,默认 GET' },
+        events: {
+          type: 'array',
+          items: { type: 'object' },
+          description: '要推送的事件数据列表,支持 {{index}} 模板',
+        },
+        intervalMs: { type: 'number', description: '事件间隔毫秒,默认 1000' },
+        closeAfterEvents: { type: 'number', description: '推送多少条后关闭,缺省持续发送' },
+        delayMs: { type: 'number', description: '首次推送前的延迟毫秒数' },
+      },
+      required: ['url'],
+    },
+  },
+  {
+    name: 'set_mock_ws',
+    description:
+      '为 WebSocket 接口配置 mock。页面通过 ws:// 连接 url 时,若配置了 initialMessage 则在连接建立后立即发送;收到客户端消息后按 responses 列表顺序循环响应。未配置 responses 时默认 echo 回原始消息。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        url: { type: 'string', description: 'WebSocket 接口路径,如 /ws/chat' },
+        initialMessage: {
+          type: 'object',
+          description: '连接建立后服务端主动发送的初始消息',
+        },
+        responses: {
+          type: 'array',
+          items: { type: 'object' },
+          description: '收到消息后的响应列表(按序循环),支持 {{index}} 模板',
+        },
+      },
+      required: ['url'],
     },
   },
   {
@@ -548,6 +836,30 @@ function callTool(name: string, args: Record<string, unknown>): unknown {
         delayMs: typeof args.delayMs === 'number' ? args.delayMs : undefined,
       })
       return { ok: true, key: ruleKey(rule.url, rule.method), mode: rule.mode, total: rule.total }
+    }
+
+    case 'set_mock_sse': {
+      if (typeof args.url !== 'string' || !args.url) throw new Error('缺少必填参数: url')
+      const rule = setMockSse({
+        url: args.url,
+        method: typeof args.method === 'string' ? args.method : undefined,
+        events: Array.isArray(args.events) ? args.events : undefined,
+        intervalMs: typeof args.intervalMs === 'number' ? args.intervalMs : undefined,
+        closeAfterEvents:
+          typeof args.closeAfterEvents === 'number' ? args.closeAfterEvents : undefined,
+        delayMs: typeof args.delayMs === 'number' ? args.delayMs : undefined,
+      })
+      return { ok: true, key: ruleKey(rule.url, rule.method), mode: rule.mode }
+    }
+
+    case 'set_mock_ws': {
+      if (typeof args.url !== 'string' || !args.url) throw new Error('缺少必填参数: url')
+      const rule = setMockWs({
+        url: args.url,
+        initialMessage: args.initialMessage,
+        responses: Array.isArray(args.responses) ? args.responses : undefined,
+      })
+      return { ok: true, key: ruleKey(rule.url, rule.method), mode: rule.mode }
     }
 
     case 'remove_mock_rule': {
@@ -679,6 +991,10 @@ if (existsSync(rulesFile)) {
         setMockList(ruleInput)
       } else if (ruleInput.mode === 'data' && ruleInput.model !== undefined) {
         setMockData(ruleInput)
+      } else if (ruleInput.mode === 'sse') {
+        setMockSse(ruleInput)
+      } else if (ruleInput.mode === 'ws') {
+        setMockWs(ruleInput)
       }
     }
     console.error(`[mock-mcp-server] 已加载 ${initialRules.length} 条初始规则`)
