@@ -1,0 +1,26 @@
+# 依赖
+node_modules/
+
+# 构建产物（发布到 npm 时才生成，不进仓库）
+dist/
+
+# npm 包锁（library 项目推荐用 pnpm/yarn，lock 文件不提交）
+package-lock.json
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+
+# 本地环境/调试
+.env
+.env.local
+__mock-rules.json
+
+# 日志
+*.log
+npm-debug.log*
