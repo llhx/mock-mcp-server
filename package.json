@@ -1,6 +1,6 @@
 {
   "name": "mock-mcp-server",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "MCP server for mock data management with HTTP data plane",
   "type": "module",
   "main": "dist/mock-server.js",
